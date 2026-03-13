@@ -107,13 +107,26 @@ function authHeaders(): Record<string, string> {
 // ─── SQL queries ──────────────────────────────────────────────────────────────
 //
 // SpacetimeDB SQL response shape (v1):
-//   { schema: { elements: [{ name, algebraic_type }] }, rows: [[val, val, ...], ...] }
+//   { schema: { elements: [{ name: string | { some: string }, algebraic_type }] },
+//     rows: [[val, val, ...], ...] }
 //
-// We convert to an array of plain objects keyed by column name.
+// Column names are serialised from Rust's Option<String> so they arrive as
+// either a plain string "col" or a wrapped object { "some": "col" }.
+// We normalise both forms before building the result objects.
+
+interface SqlElement {
+  name: string | { some: string } | null
+}
 
 interface SqlResponse {
-  schema?: { elements?: Array<{ name: string }> }
+  schema?: { elements?: SqlElement[] }
   rows?:   unknown[][]
+}
+
+function elementName(e: SqlElement): string {
+  if (!e.name) return ''
+  if (typeof e.name === 'string') return e.name
+  return (e.name as { some: string }).some ?? String(e.name)
 }
 
 export async function sql(query: string): Promise<Record<string, unknown>[]> {
@@ -134,7 +147,7 @@ export async function sql(query: string): Promise<Record<string, unknown>[]> {
   const result: SqlResponse = Array.isArray(raw) ? raw[0] : raw
   if (!result) return []
 
-  const cols = result.schema?.elements?.map(e => e.name) ?? []
+  const cols = result.schema?.elements?.map(elementName) ?? []
   const rows = result.rows ?? []
 
   if (cols.length === 0) return rows as Record<string, unknown>[]
