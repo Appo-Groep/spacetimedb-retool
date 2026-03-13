@@ -129,6 +129,26 @@ function elementName(e: SqlElement): string {
   return (e.name as { some: string }).some ?? String(e.name)
 }
 
+// SpacetimeDB encodes sum types (Option, enums) as discriminant arrays:
+//   Some(x) → [0, x]
+//   None    → [1]
+// Unwrap these recursively so callers get plain JS values.
+function unwrapValue(v: unknown): unknown {
+  if (Array.isArray(v)) {
+    if (v.length === 2 && v[0] === 0) return unwrapValue(v[1])  // Some(x)
+    if (v.length === 1 && v[0] === 1) return null               // None
+    return v.map(unwrapValue)
+  }
+  if (v !== null && typeof v === 'object') {
+    // { "some": x } form (alternative encoding)
+    if ('some' in v) return unwrapValue((v as Record<string, unknown>)['some'])
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>).map(([k, val]) => [k, unwrapValue(val)])
+    )
+  }
+  return v
+}
+
 export async function sql(query: string): Promise<Record<string, unknown>[]> {
   const { Authorization } = authHeaders()
   const res = await fetch(dbUrl('/sql'), {
@@ -153,7 +173,7 @@ export async function sql(query: string): Promise<Record<string, unknown>[]> {
   if (cols.length === 0) return rows as Record<string, unknown>[]
 
   return rows.map(row =>
-    Object.fromEntries(cols.map((col, i) => [col, row[i]]))
+    Object.fromEntries(cols.map((col, i) => [col, unwrapValue(row[i])]))
   )
 }
 
