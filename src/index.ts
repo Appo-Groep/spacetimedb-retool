@@ -117,10 +117,11 @@ interface SqlResponse {
 }
 
 export async function sql(query: string): Promise<Record<string, unknown>[]> {
+  const { Authorization } = authHeaders()
   const res = await fetch(dbUrl('/sql'), {
     method:  'POST',
-    headers: authHeaders(),
-    body:    JSON.stringify({ query }),
+    headers: { Authorization, 'Content-Type': 'text/plain' },
+    body:    query,
   })
   if (!res.ok) {
     const text = await res.text()
