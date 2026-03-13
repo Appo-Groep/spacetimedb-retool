@@ -1,0 +1,17 @@
+{
+  "name": "spacetimedb-retool",
+  "version": "0.1.0",
+  "description": "Generic SpacetimeDB adapter for Retool — HTTP REST API, no WebSocket, no generated bindings",
+  "main": "dist/spacetimedb-retool.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "codegen": "npx ts-node codegen/index.ts"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.0"
+  },
+  "keywords": ["spacetimedb", "retool"],
+  "license": "MIT"
+}
