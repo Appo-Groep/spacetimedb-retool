@@ -67,11 +67,13 @@ function getToken(): string | null {
 // ─── Status + user info ───────────────────────────────────────────────────────
 
 export interface ConnectedUser {
-  username:    string
-  employeeTag: string
-  role:        string
+  username:         string
+  employeeTag:      string
+  role:             string
   /** Unix timestamp (seconds) when the token expires */
-  expiresAt:   number | null
+  expiresAt:        number | null
+  /** Seconds remaining until expiry (0 if already expired) */
+  expiresInSeconds: number | null
 }
 
 function decodeJwt(token: string): Record<string, unknown> {
@@ -84,29 +86,40 @@ function decodeJwt(token: string): Record<string, unknown> {
 }
 
 /**
- * 'unconfigured'   — configure() has not been called
+ * 'unconfigured'    — configure() has not been called
  * 'unauthenticated' — configured but no token
- * 'ready'           — configured + token present (may still get 401 if token expired)
+ * 'ready'           — configured + token present
  */
 function getStatus(): 'unconfigured' | 'unauthenticated' | 'ready' {
-  if (!_config)  return 'unconfigured'
-  if (!_token)   return 'unauthenticated'
+  if (!_config) return 'unconfigured'
+  if (!_token)  return 'unauthenticated'
   return 'ready'
 }
 
 /** Returns decoded fields from the current JWT, or null if not authenticated. */
 function getUser(): ConnectedUser | null {
   if (!_token) return null
-  const p = decodeJwt(_token)
+  const p         = decodeJwt(_token)
+  const expiresAt = typeof p['exp'] === 'number' ? (p['exp'] as number) : null
   return {
-    username:    (p['username']     as string) ?? (p['sub'] as string) ?? '',
-    employeeTag: (p['employee_tag'] as string) ?? '',
-    role:        (p['role']         as string) ?? 'employee',
-    expiresAt:   typeof p['exp'] === 'number' ? p['exp'] as number : null,
+    username:         (p['username']     as string) ?? (p['sub'] as string) ?? '',
+    employeeTag:      (p['employee_tag'] as string) ?? '',
+    role:             (p['role']         as string) ?? 'employee',
+    expiresAt,
+    expiresInSeconds: expiresAt !== null ? Math.max(0, expiresAt - Math.floor(Date.now() / 1000)) : null,
   }
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
+
+type AuthEvent    = 'login' | 'refresh' | 'logout' | 'expired'
+type AuthListener = (event: AuthEvent, user: ConnectedUser | null) => void
+
+const _authListeners = new Set<AuthListener>()
+
+function _fireAuth(event: AuthEvent): void {
+  _authListeners.forEach(fn => fn(event, getUser()))
+}
 
 async function login(username: string, password: string): Promise<LoginResult> {
   const { authBase } = assertConfig()
@@ -121,6 +134,7 @@ async function login(username: string, password: string): Promise<LoginResult> {
   }
   const data = await res.json() as LoginResult
   _token = data.token
+  _fireAuth('login')
   return data
 }
 
@@ -134,7 +148,75 @@ async function refresh(): Promise<LoginResult> {
   if (!res.ok) throw new Error('Token refresh failed — please log in again')
   const data = await res.json() as LoginResult
   _token = data.token
+  _fireAuth('refresh')
   return data
+}
+
+function logout(): void {
+  _token = null
+  stopAutoRefresh()
+  // Disconnect live WS — imported below as live.disconnect(), but we call the
+  // internal state directly to avoid a forward-reference cycle.
+  _wsEnabled = false
+  if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null }
+  if (_ws) { _ws.onclose = null; _ws.close(); _ws = null }
+  _fireAuth('logout')
+}
+
+// ─── Background auto-refresh ──────────────────────────────────────────────────
+//
+// Checks token expiry every minute and on every tab/device wake.
+// Refreshes silently when within REFRESH_BEFORE_MS of expiry.
+// Calls logout() (fires 'expired') if the server rejects the refresh.
+// The live WebSocket is NOT reconnected — SpacetimeDB validates tokens only at
+// connect time, so the existing socket continues working after a token refresh.
+
+const REFRESH_BEFORE_MS = 5  * 60 * 1000   // refresh when 5 min remaining
+const REFRESH_CHECK_MS  = 60 * 1000         // poll every 60 s
+
+let _autoRefreshCleanup: (() => void) | null = null
+
+function stopAutoRefresh(): void {
+  if (_autoRefreshCleanup) { _autoRefreshCleanup(); _autoRefreshCleanup = null }
+}
+
+function startAutoRefresh(): void {
+  stopAutoRefresh()
+
+  const tryRefresh = async () => {
+    if (!_token || !_config) return
+    const p = decodeJwt(_token)
+    if (typeof p['exp'] !== 'number') return
+
+    const msLeft = (p['exp'] as number) * 1000 - Date.now()
+
+    if (msLeft <= 0) {
+      console.warn('[SpacetimeDB] Token expired — logging out')
+      logout()
+      _fireAuth('expired')
+      return
+    }
+
+    if (msLeft > REFRESH_BEFORE_MS) return   // plenty of time left
+
+    console.log('[SpacetimeDB] Token expires in', Math.round(msLeft / 1000), 's — refreshing')
+    try {
+      await refresh()   // sets _token + fires 'refresh'
+    } catch (err) {
+      console.warn('[SpacetimeDB] Refresh failed — logging out:', err)
+      logout()
+    }
+  }
+
+  const timer     = setInterval(tryRefresh, REFRESH_CHECK_MS)
+  const onVisible = () => { if (document.visibilityState === 'visible') void tryRefresh() }
+  document.addEventListener('visibilitychange', onVisible)
+  void tryRefresh()   // check immediately
+
+  _autoRefreshCleanup = () => {
+    clearInterval(timer)
+    document.removeEventListener('visibilitychange', onVisible)
+  }
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -502,7 +584,18 @@ const api = {
   call,
   live,
   admin,
-  auth: { login, refresh },
+  auth: {
+    login,
+    refresh,
+    logout,
+    startAutoRefresh,
+    stopAutoRefresh,
+    /** Subscribe to auth lifecycle events: 'login' | 'refresh' | 'logout' | 'expired' */
+    onChange(fn: AuthListener): () => void {
+      _authListeners.add(fn)
+      return () => _authListeners.delete(fn)
+    },
+  },
 }
 
 ;(window as any).SpacetimeDB = api
