@@ -2,13 +2,18 @@
  * spacetimedb-retool
  *
  * Generic SpacetimeDB adapter for Retool.
- * Uses SpacetimeDB's HTTP REST API — no generated bindings, no BSATN, no WebSocket.
+ * HTTP REST API for queries/reducers + optional WebSocket (JSON protocol) for live subscriptions.
  *
  * Exposes window.SpacetimeDB after loading as an external library in Retool.
  *
  * Usage in Retool JS queries:
  *   await window.SpacetimeDB.call('refill_location', { product_location_id: '5', quantity_added: 100 })
  *   const rows = await window.SpacetimeDB.sql('SELECT * FROM devices WHERE is_active = true')
+ *
+ * Live subscriptions:
+ *   window.SpacetimeDB.live.connect(['SELECT * FROM crates', 'SELECT * FROM devices'])
+ *   window.SpacetimeDB.live.onChange((table, rows) => { ... })
+ *   window.SpacetimeDB.live.getTable('crates')  // current cached rows
  */
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -290,6 +295,201 @@ export const admin = {
   deleteUser:  (apiKey: string, username: string)                   => adminRequest('DELETE', `/auth/admin/users/${username}`, apiKey)       as Promise<{ deleted: string }>,
 }
 
+// ─── Live WebSocket subscriptions ────────────────────────────────────────────
+//
+// Uses SpacetimeDB's JSON WebSocket protocol (v1.json.spacetimedb) so no
+// binary BSATN decoding is needed.
+//
+// Server → client message shapes we care about:
+//
+//   IdentityToken      { identity, token, address }
+//   InitialSubscription { database_update: { tables: [{ table_name, updates: { inserts, deletes } }] } }
+//   TransactionUpdate  { database_update: { tables: [...] }, status: { Committed? } }
+//
+// Each row in inserts/deletes is a plain JSON array (one element per column).
+// The schema (column names) is provided in the same table object.
+//
+// Reconnect strategy: automatic exponential back-off (1s → 2s → 4s … 30s cap).
+
+type ChangeListener = (table: string, rows: Record<string, unknown>[]) => void
+
+interface WsTableSchema {
+  elements: SqlElement[]
+}
+
+interface WsTableUpdate {
+  table_id:   number
+  table_name: string
+  schema?:    WsTableSchema
+  updates: {
+    inserts: unknown[][]
+    deletes: unknown[][]
+  }
+}
+
+interface WsDatabaseUpdate {
+  tables: WsTableUpdate[]
+}
+
+interface WsServerMessage {
+  IdentityToken?:       { identity: string; token: string; address: string }
+  InitialSubscription?: { database_update: WsDatabaseUpdate; request_id: number }
+  TransactionUpdate?:   { database_update: WsDatabaseUpdate; status: Record<string, unknown> }
+}
+
+// Per-table schema cache: populated from the first InitialSubscription that includes a schema
+const _schemaCache: Record<string, string[]> = {}
+// Per-table row cache keyed by primary-key position [0] stringified
+const _tableCache:  Record<string, Map<string, Record<string, unknown>>> = {}
+
+let _ws:               WebSocket | null   = null
+let _wsQueries:        string[]           = []
+let _wsListeners:      Set<ChangeListener> = new Set()
+let _wsReconnectTimer: ReturnType<typeof setTimeout> | null = null
+let _wsReconnectDelay  = 1000
+let _wsEnabled         = false
+
+function wsBaseUrl(): string {
+  const { httpBase, database } = assertConfig()
+  // http(s) → ws(s), strip trailing slash
+  const base = httpBase.replace(/^http/, 'ws').replace(/\/$/, '')
+  return `${base}/v1/database/${encodeURIComponent(database)}/subscribe`
+}
+
+function applyTableUpdate(update: WsTableUpdate): Record<string, unknown>[] {
+  const name = update.table_name
+
+  // Update schema cache if provided
+  if (update.schema?.elements) {
+    _schemaCache[name] = update.schema.elements.map(elementName)
+  }
+  const cols = _schemaCache[name] ?? []
+
+  if (!_tableCache[name]) _tableCache[name] = new Map()
+  const cache = _tableCache[name]!
+
+  const toObj = (row: unknown[]): Record<string, unknown> =>
+    cols.length > 0
+      ? Object.fromEntries(cols.map((col, i) => [col, unwrapValue(row[i])]))
+      : { _row: row.map(unwrapValue) }
+
+  // Apply deletes first
+  for (const row of (update.updates.deletes ?? [])) {
+    const obj = toObj(row as unknown[])
+    const pk  = String(obj[cols[0] ?? '_row'] ?? JSON.stringify(obj))
+    cache.delete(pk)
+  }
+
+  // Apply inserts / upserts
+  for (const row of (update.updates.inserts ?? [])) {
+    const obj = toObj(row as unknown[])
+    const pk  = String(obj[cols[0] ?? '_row'] ?? JSON.stringify(obj))
+    cache.set(pk, obj)
+  }
+
+  return Array.from(cache.values())
+}
+
+function handleWsMessage(raw: string): void {
+  let msg: WsServerMessage
+  try { msg = JSON.parse(raw) } catch { return }
+
+  if (msg.IdentityToken) {
+    console.log('[SpacetimeDB WS] Connected, identity:', msg.IdentityToken.identity)
+    _wsReconnectDelay = 1000
+    // Send subscription
+    const sub = JSON.stringify({ Subscribe: { query_strings: _wsQueries } })
+    _ws?.send(sub)
+    return
+  }
+
+  const dbUpdate =
+    msg.InitialSubscription?.database_update ??
+    msg.TransactionUpdate?.database_update
+
+  if (!dbUpdate) return
+
+  // Skip failed transactions
+  if (msg.TransactionUpdate && !msg.TransactionUpdate.status?.['Committed']) return
+
+  for (const tableUpdate of (dbUpdate.tables ?? [])) {
+    const rows = applyTableUpdate(tableUpdate)
+    _wsListeners.forEach(fn => fn(tableUpdate.table_name, rows))
+  }
+}
+
+function wsConnect(): void {
+  if (_ws) { _ws.onclose = null; _ws.close() }
+
+  const token = _token
+  const url   = wsBaseUrl() + (token ? `?token=${encodeURIComponent(token)}` : '')
+
+  const socket = new WebSocket(url, ['v1.json.spacetimedb'])
+  _ws = socket
+
+  socket.onmessage = (e) => handleWsMessage(e.data as string)
+
+  socket.onerror = (e) => console.warn('[SpacetimeDB WS] Error:', e)
+
+  socket.onclose = (e) => {
+    _ws = null
+    if (!_wsEnabled) return
+    console.warn(`[SpacetimeDB WS] Closed (${e.code}) — reconnecting in ${_wsReconnectDelay}ms`)
+    _wsReconnectTimer = setTimeout(() => {
+      _wsReconnectDelay = Math.min(_wsReconnectDelay * 2, 30_000)
+      wsConnect()
+    }, _wsReconnectDelay)
+  }
+}
+
+export const live = {
+  /**
+   * Open a WebSocket subscription. Automatically reconnects on disconnect.
+   * @param queries  SQL SELECT queries to subscribe to, e.g. ['SELECT * FROM crates']
+   */
+  connect(queries: string[]): void {
+    if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null }
+    _wsEnabled   = true
+    _wsQueries   = queries
+    _tableCache  // keep existing cache across reconnects
+    wsConnect()
+  },
+
+  /** Close the WebSocket and stop reconnecting. */
+  disconnect(): void {
+    _wsEnabled = false
+    if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null }
+    if (_ws) { _ws.onclose = null; _ws.close(); _ws = null }
+  },
+
+  /** True when the WebSocket is open and ready. */
+  isConnected(): boolean {
+    return _ws?.readyState === WebSocket.OPEN
+  },
+
+  /**
+   * Get the current cached rows for a subscribed table.
+   * Returns [] before the initial subscription arrives.
+   */
+  getTable(name: string): Record<string, unknown>[] {
+    return _tableCache[name] ? Array.from(_tableCache[name]!.values()) : []
+  },
+
+  /**
+   * Register a callback fired whenever subscribed table data changes.
+   * Returns an unsubscribe function.
+   *
+   * @example
+   * const unsub = window.SpacetimeDB.live.onChange((table, rows) => {
+   *   if (table === 'crates') cratesState.setValue(rows)
+   * })
+   */
+  onChange(fn: ChangeListener): () => void {
+    _wsListeners.add(fn)
+    return () => _wsListeners.delete(fn)
+  },
+}
+
 // ─── Expose on window ─────────────────────────────────────────────────────────
 
 const api = {
@@ -300,6 +500,7 @@ const api = {
   getUser,
   sql,
   call,
+  live,
   admin,
   auth: { login, refresh },
 }
