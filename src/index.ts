@@ -118,7 +118,9 @@ type AuthListener = (event: AuthEvent, user: ConnectedUser | null) => void
 const _authListeners = new Set<AuthListener>()
 
 function _fireAuth(event: AuthEvent): void {
-  _authListeners.forEach(fn => fn(event, getUser()))
+  const user = getUser()
+  _authListeners.forEach(fn => fn(event, user))
+  dispatch('stdb-auth', { event, user })
 }
 
 async function login(username: string, password: string): Promise<LoginResult> {
@@ -377,6 +379,22 @@ export const admin = {
   deleteUser:  (apiKey: string, username: string)                   => adminRequest('DELETE', `/auth/admin/users/${username}`, apiKey)       as Promise<{ deleted: string }>,
 }
 
+// ─── DOM event bus ────────────────────────────────────────────────────────────
+//
+// The library auto-dispatches CustomEvents on window so any Retool JS query
+// (or Retool Module) can react without calling any programmatic API.
+//
+// Events:
+//   'stdb-auth'   detail: { event: AuthEvent, user: ConnectedUser | null }
+//   'stdb-table'  detail: { table: string, rows: Record<string,unknown>[] }
+//   'stdb-status' detail: { connected: boolean }
+
+function dispatch(name: string, detail: unknown): void {
+  try {
+    window.dispatchEvent(new CustomEvent(name, { detail }))
+  } catch { /* non-browser environment */ }
+}
+
 // ─── Live WebSocket subscriptions ────────────────────────────────────────────
 //
 // Uses SpacetimeDB's JSON WebSocket protocol (v1.json.spacetimedb) so no
@@ -479,6 +497,7 @@ function handleWsMessage(raw: string): void {
   if (msg.IdentityToken) {
     console.log('[SpacetimeDB WS] Connected, identity:', msg.IdentityToken.identity)
     _wsReconnectDelay = 1000
+    dispatch('stdb-status', { connected: true })
     // Send subscription
     const sub = JSON.stringify({ Subscribe: { query_strings: _wsQueries } })
     _ws?.send(sub)
@@ -497,6 +516,7 @@ function handleWsMessage(raw: string): void {
   for (const tableUpdate of (dbUpdate.tables ?? [])) {
     const rows = applyTableUpdate(tableUpdate)
     _wsListeners.forEach(fn => fn(tableUpdate.table_name, rows))
+    dispatch('stdb-table', { table: tableUpdate.table_name, rows })
   }
 }
 
@@ -515,6 +535,7 @@ function wsConnect(): void {
 
   socket.onclose = (e) => {
     _ws = null
+    dispatch('stdb-status', { connected: false })
     if (!_wsEnabled) return
     console.warn(`[SpacetimeDB WS] Closed (${e.code}) — reconnecting in ${_wsReconnectDelay}ms`)
     _wsReconnectTimer = setTimeout(() => {
