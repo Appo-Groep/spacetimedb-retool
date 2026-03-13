@@ -59,6 +59,48 @@ function getToken(): string | null {
   return _token
 }
 
+// ─── Status + user info ───────────────────────────────────────────────────────
+
+export interface ConnectedUser {
+  username:    string
+  employeeTag: string
+  role:        string
+  /** Unix timestamp (seconds) when the token expires */
+  expiresAt:   number | null
+}
+
+function decodeJwt(token: string): Record<string, unknown> {
+  try {
+    const b64 = token.split('.')[1]!.replace(/-/g, '+').replace(/_/g, '/')
+    return JSON.parse(atob(b64)) as Record<string, unknown>
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * 'unconfigured'   — configure() has not been called
+ * 'unauthenticated' — configured but no token
+ * 'ready'           — configured + token present (may still get 401 if token expired)
+ */
+function getStatus(): 'unconfigured' | 'unauthenticated' | 'ready' {
+  if (!_config)  return 'unconfigured'
+  if (!_token)   return 'unauthenticated'
+  return 'ready'
+}
+
+/** Returns decoded fields from the current JWT, or null if not authenticated. */
+function getUser(): ConnectedUser | null {
+  if (!_token) return null
+  const p = decodeJwt(_token)
+  return {
+    username:    (p['username']     as string) ?? (p['sub'] as string) ?? '',
+    employeeTag: (p['employee_tag'] as string) ?? '',
+    role:        (p['role']         as string) ?? 'employee',
+    expiresAt:   typeof p['exp'] === 'number' ? p['exp'] as number : null,
+  }
+}
+
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
 async function login(username: string, password: string): Promise<LoginResult> {
@@ -254,6 +296,8 @@ const api = {
   configure,
   setToken,
   getToken,
+  getStatus,
+  getUser,
   sql,
   call,
   admin,
